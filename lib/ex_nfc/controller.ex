@@ -69,15 +69,19 @@ defmodule ExNfc.Controller do
   @nfc_attr_tm_protocols 14
 
   # ---- NFC protocol bitmask (uapi/linux/nfc.h) ---------------------------
-  # `NFC_PROTO_*` shift values.
+  # `NFC_PROTO_*` shift values. These are **1-indexed** in the kernel
+  # uAPI (`include/uapi/linux/nfc.h`), not 0-indexed — getting this
+  # wrong is what produced "the target found does not have the desired
+  # protocol" rejections in the kernel for every ISO-DEP card. Stay
+  # in sync with uapi/linux/nfc.h.
 
-  @nfc_proto_jewel 0
-  @nfc_proto_mifare 1
-  @nfc_proto_felica 2
-  @nfc_proto_iso14443 3
-  @nfc_proto_iso14443_b 5
-  @nfc_proto_iso15693 6
-  @nfc_proto_nfc_dep 4
+  @nfc_proto_jewel 1
+  @nfc_proto_mifare 2
+  @nfc_proto_felica 3
+  @nfc_proto_iso14443 4
+  @nfc_proto_nfc_dep 5
+  @nfc_proto_iso14443_b 6
+  @nfc_proto_iso15693 7
 
   @poll_protocols_default bsl(1, @nfc_proto_jewel) |||
                             bsl(1, @nfc_proto_mifare) |||
@@ -579,7 +583,14 @@ defmodule ExNfc.Controller do
     parsed = Netlink.parse_attrs(attrs)
 
     case cmd do
-      c when c in [@nfc_event_targets_found, @nfc_cmd_get_target] ->
+      # NFC_EVENT_TARGETS_FOUND only carries NFC_ATTR_DEVICE_INDEX; per-target
+      # details (UID, SENS_RES, etc.) are fetched via a separate
+      # NFC_CMD_GET_TARGET dump. Issue that dump now — responses come back
+      # async on this same socket as cmd = NFC_CMD_GET_TARGET messages.
+      @nfc_event_targets_found ->
+        request_targets(state, u32(parsed, @nfc_attr_device_index))
+
+      @nfc_cmd_get_target ->
         target = parse_target(parsed)
         broadcast({:tag_found, Map.put(target, :device, state.device_name)})
 
@@ -596,6 +607,19 @@ defmodule ExNfc.Controller do
         :ok
     end
   end
+
+  # Send a NFC_CMD_GET_TARGET dump request for the given device. We don't wait
+  # — the kernel's reply (one message per target, cmd = NFC_CMD_GET_TARGET) is
+  # delivered through the normal `:"$socket"` event flow and dispatched back
+  # through handle_nfc_event above.
+  defp request_targets(%{sock: sock, family_id: fid}, idx) when is_integer(idx) do
+    attrs = Netlink.nla_u32(@nfc_attr_device_index, idx)
+    msg = Netlink.pack(fid, @nfc_cmd_get_target, Netlink.dump_flags(), attrs)
+    _ = :socket.send(sock, msg)
+    :ok
+  end
+
+  defp request_targets(_state, _idx), do: :ok
 
   defp parse_target(parsed) do
     nfcid1 = Netlink.find_attr(parsed, @nfc_attr_target_nfcid1)
