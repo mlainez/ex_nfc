@@ -140,6 +140,7 @@ defmodule ExNfc.Controller do
       device_name: nil,
       poll_protocols: Keyword.get(opts, :poll_protocols, @poll_protocols_default),
       autostart: Keyword.get(opts, :autostart, true),
+      polling: false,
       buf: <<>>
     }
 
@@ -212,17 +213,23 @@ defmodule ExNfc.Controller do
             poll_protocols: poll
         }
 
-        if state.autostart do
-          case bring_up_and_poll(state) do
-            :ok ->
-              Logger.info(
-                "[ExNfc] polling started on #{state.device_name} (im_protocols=0x#{Integer.to_string(poll, 16)})"
-              )
+        state =
+          if state.autostart do
+            case bring_up_and_poll(state) do
+              :ok ->
+                Logger.info(
+                  "[ExNfc] polling started on #{state.device_name} (im_protocols=0x#{Integer.to_string(poll, 16)})"
+                )
 
-            {:error, reason} ->
-              Logger.error("[ExNfc] autostart failed: #{inspect(reason)}")
+                %{state | polling: true}
+
+              {:error, reason} ->
+                Logger.error("[ExNfc] autostart failed: #{inspect(reason)}")
+                state
+            end
+          else
+            state
           end
-        end
 
         install_recv(state.sock)
         {:noreply, state}
@@ -245,15 +252,30 @@ defmodule ExNfc.Controller do
     {:reply, dump_devices(sock, fid), state}
   end
 
+  def handle_call(:start_polling, _from, %{polling: true} = state) do
+    {:reply, :ok, state}
+  end
+
   def handle_call(:start_polling, _from, state) do
-    {:reply, start_poll_cmd(state), state}
+    case start_poll_cmd(state) do
+      :ok -> {:reply, :ok, %{state | polling: true}}
+      err -> {:reply, err, state}
+    end
+  end
+
+  def handle_call(:stop_polling, _from, %{polling: false} = state) do
+    {:reply, :ok, state}
   end
 
   def handle_call(:stop_polling, _from, %{family_id: fid, sock: sock, device_index: idx} = state)
       when not is_nil(idx) do
     attrs = Netlink.nla_u32(@nfc_attr_device_index, idx)
     msg = Netlink.pack(fid, @nfc_cmd_stop_poll, Netlink.request_flags(), attrs)
-    {:reply, send_and_wait_ack(sock, msg), state}
+
+    case send_and_wait_ack(sock, msg) do
+      :ok -> {:reply, :ok, %{state | polling: false}}
+      err -> {:reply, err, state}
+    end
   end
 
   def handle_call(:stop_polling, _from, state), do: {:reply, {:error, :no_device}, state}

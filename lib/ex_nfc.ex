@@ -34,11 +34,21 @@ defmodule ExNfc do
   `stop_polling/0`.
   """
 
-  @doc "Subscribe the calling process to NFC events."
+  @doc """
+  Subscribe the calling process to NFC events.
+
+  Idempotent: calling this multiple times from the same process does
+  not register multiple times, so each tap will produce exactly one
+  `{ExNfc, :tag_found, _}` message per subscribed process.
+  """
   @spec subscribe() :: :ok
   def subscribe() do
-    {:ok, _} = Registry.register(ExNfc.Registry, :tag_events, [])
-    :ok
+    if :tag_events in Registry.keys(ExNfc.Registry, self()) do
+      :ok
+    else
+      {:ok, _} = Registry.register(ExNfc.Registry, :tag_events, [])
+      :ok
+    end
   end
 
   @doc "Unsubscribe the calling process."
