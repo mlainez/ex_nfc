@@ -29,13 +29,13 @@ defmodule ExNfc.Logger do
   end
 
   @impl GenServer
-  def handle_info({ExNfc, :tag_found, target}, state) do
-    Logger.info("[ExNfc] tap " <> format_tag(target))
+  def handle_info({ExNfc, :tag_arrived, target}, state) do
+    Logger.info("[ExNfc] tag arrived " <> format_tag(target))
     {:noreply, state}
   end
 
-  def handle_info({ExNfc, :tag_lost, _}, state) do
-    Logger.info("[ExNfc] tag lost")
+  def handle_info({ExNfc, :tag_departed, %{idx: idx}}, state) do
+    Logger.info("[ExNfc] tag departed idx=#{inspect(idx)}")
     {:noreply, state}
   end
 

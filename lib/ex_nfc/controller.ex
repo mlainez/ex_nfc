@@ -106,6 +106,13 @@ defmodule ExNfc.Controller do
       Defaults to "everything except NFC-DEP" (i.e. tags, no peer-to-peer).
     * `:autostart` — when `true` (default), automatically bring the
       controller up and start polling. Set `false` for manual control.
+    * `:resume_after_tap` — what to do once a tag has been activated:
+      * `:auto` (default) — immediately deactivate + restart polling, so
+        every distinct tap produces another `{:tag_arrived, _}`.
+      * `:manual` — leave the chip in tag-active state; caller is expected
+        to do data exchange and then call `ExNfc.deactivate/0` to resume.
+      * `:one_shot` — deactivate the tag but do not restart polling.
+        Subsequent taps require an explicit `ExNfc.start_polling/0`.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -116,13 +123,29 @@ defmodule ExNfc.Controller do
   @spec list_devices() :: [map()]
   def list_devices(), do: GenServer.call(__MODULE__, :list_devices)
 
-  @doc "Start polling on the bound device."
+  @doc """
+  Start polling on the bound device. Returns `:ok` if polling is now
+  running (whether it had to start or was already started).
+  """
   @spec start_polling() :: :ok | {:error, term()}
   def start_polling(), do: GenServer.call(__MODULE__, :start_polling)
 
   @doc "Stop polling on the bound device."
   @spec stop_polling() :: :ok | {:error, term()}
   def stop_polling(), do: GenServer.call(__MODULE__, :stop_polling)
+
+  @doc """
+  Take the chip out of tag-active state and return it to polling.
+
+  Use this in `:manual` mode after you're done with the tag. No-op when
+  no tag is currently active.
+  """
+  @spec deactivate() :: :ok | {:error, term()}
+  def deactivate(), do: GenServer.call(__MODULE__, :deactivate)
+
+  @doc "Return the current state machine atom: `:idle | :polling | :tag_active`."
+  @spec state() :: :idle | :polling | :tag_active
+  def state(), do: GenServer.call(__MODULE__, :state)
 
   @doc "Bring the bound device down (radio off)."
   @spec dev_down() :: :ok | {:error, term()}
@@ -140,7 +163,12 @@ defmodule ExNfc.Controller do
       device_name: nil,
       poll_protocols: Keyword.get(opts, :poll_protocols, @poll_protocols_default),
       autostart: Keyword.get(opts, :autostart, true),
-      polling: false,
+      resume_after_tap: Keyword.get(opts, :resume_after_tap, :auto),
+      # State machine: :idle (controller up, not polling)
+      #              | :polling (chip in NCI_DISCOVERY, waiting for a tag)
+      #              | :tag_active (chip activated a tag, polling paused)
+      fsm: :idle,
+      active_target: nil,
       buf: <<>>
     }
 
@@ -221,7 +249,7 @@ defmodule ExNfc.Controller do
                   "[ExNfc] polling started on #{state.device_name} (im_protocols=0x#{Integer.to_string(poll, 16)})"
                 )
 
-                %{state | polling: true}
+                %{state | fsm: :polling}
 
               {:error, reason} ->
                 Logger.error("[ExNfc] autostart failed: #{inspect(reason)}")
@@ -252,18 +280,28 @@ defmodule ExNfc.Controller do
     {:reply, dump_devices(sock, fid), state}
   end
 
-  def handle_call(:start_polling, _from, %{polling: true} = state) do
+  def handle_call(:state, _from, state), do: {:reply, state.fsm, state}
+
+  def handle_call(:start_polling, _from, %{fsm: :polling} = state) do
     {:reply, :ok, state}
   end
 
-  def handle_call(:start_polling, _from, state) do
-    case start_poll_cmd(state) do
-      :ok -> {:reply, :ok, %{state | polling: true}}
+  def handle_call(:start_polling, _from, %{fsm: :tag_active} = state) do
+    # Caller wants polling; first deactivate, then restart.
+    case deactivate_and_repoll(state) do
+      :ok -> {:reply, :ok, %{state | fsm: :polling, active_target: nil}}
       err -> {:reply, err, state}
     end
   end
 
-  def handle_call(:stop_polling, _from, %{polling: false} = state) do
+  def handle_call(:start_polling, _from, state) do
+    case start_poll_cmd(state) do
+      :ok -> {:reply, :ok, %{state | fsm: :polling}}
+      err -> {:reply, err, state}
+    end
+  end
+
+  def handle_call(:stop_polling, _from, %{fsm: :idle} = state) do
     {:reply, :ok, state}
   end
 
@@ -273,12 +311,25 @@ defmodule ExNfc.Controller do
     msg = Netlink.pack(fid, @nfc_cmd_stop_poll, Netlink.request_flags(), attrs)
 
     case send_and_wait_ack(sock, msg) do
-      :ok -> {:reply, :ok, %{state | polling: false}}
+      :ok -> {:reply, :ok, %{state | fsm: :idle, active_target: nil}}
       err -> {:reply, err, state}
     end
   end
 
   def handle_call(:stop_polling, _from, state), do: {:reply, {:error, :no_device}, state}
+
+  def handle_call(:deactivate, _from, %{fsm: :tag_active} = state) do
+    case deactivate_and_repoll(state) do
+      :ok ->
+        broadcast_departed(state)
+        {:reply, :ok, %{state | fsm: :polling, active_target: nil}}
+
+      err ->
+        {:reply, err, state}
+    end
+  end
+
+  def handle_call(:deactivate, _from, state), do: {:reply, :ok, state}
 
   def handle_call(:dev_down, _from, %{family_id: fid, sock: sock, device_index: idx} = state)
       when not is_nil(idx) do
@@ -588,16 +639,14 @@ defmodule ExNfc.Controller do
 
   defp handle_data(buf, state) do
     msgs = Netlink.parse_nlmsgs(buf)
-    Enum.each(msgs, fn m -> dispatch(m, state) end)
+    state = Enum.reduce(msgs, state, fn m, acc -> dispatch(m, acc) end)
     %{state | buf: <<>>}
   end
 
   defp dispatch({type, _flags, _seq, _pid, body}, state) do
     cond do
       type == state.family_id -> handle_nfc_event(body, state)
-      type == Netlink.nlmsg_error() -> :ok
-      type == Netlink.nlmsg_done() -> :ok
-      true -> :ok
+      true -> state
     end
   end
 
@@ -606,36 +655,67 @@ defmodule ExNfc.Controller do
 
     case cmd do
       # NFC_EVENT_TARGETS_FOUND only carries NFC_ATTR_DEVICE_INDEX; per-target
-      # details (UID, SENS_RES, etc.) are fetched via a separate
-      # NFC_CMD_GET_TARGET dump. Issue that dump now — responses come back
-      # async on this same socket as cmd = NFC_CMD_GET_TARGET messages.
-      #
-      # Auto-activation leaves the chip in NCI_POLL_ACTIVE: no further tags
-      # are discovered until the host explicitly returns it to NCI_DISCOVERY.
-      # Pipeline STOP_POLL + START_POLL immediately after the dump request
-      # — kernel processes a single socket's messages in order, so the
-      # GET_TARGET responses complete before STOP_POLL clears state.
+      # details (UID, SENS_RES, etc.) come back via NFC_CMD_GET_TARGET dump.
+      # Issue that dump now — its replies arrive async as cmd = GET_TARGET.
       @nfc_event_targets_found ->
         idx = u32(parsed, @nfc_attr_device_index)
         request_targets(state, idx)
-        resume_polling(state, idx)
+        state
+        |> Map.put(:fsm, :tag_active)
+        # The dump reply, dispatched as @nfc_cmd_get_target below, will
+        # populate :active_target and apply the resume policy.
 
       @nfc_cmd_get_target ->
-        target = parse_target(parsed)
-        broadcast({:tag_found, Map.put(target, :device, state.device_name)})
+        target =
+          parsed
+          |> parse_target()
+          |> Map.put(:device, state.device_name)
+
+        broadcast({:tag_arrived, target})
+        apply_resume_policy(state, target)
 
       @nfc_event_target_lost ->
-        broadcast({:tag_lost, %{device: state.device_name}})
+        broadcast_departed(state)
+        %{state | active_target: nil, fsm: :polling}
 
       @nfc_event_device_added ->
         broadcast({:device_added, %{index: u32(parsed, @nfc_attr_device_index)}})
+        state
 
       @nfc_event_device_removed ->
         broadcast({:device_removed, %{index: u32(parsed, @nfc_attr_device_index)}})
+        state
 
       _ ->
-        :ok
+        state
     end
+  end
+
+  # `:auto`     — drop the tag immediately, restart polling. Each tap = an
+  #               `{:tag_arrived, _}` followed by `{:tag_departed, _}`.
+  # `:manual`   — leave the chip in `:tag_active`. Caller must call
+  #               `ExNfc.deactivate/0` (or `ExNfc.start_polling/0`) to resume.
+  # `:one_shot` — drop the tag but do not restart polling. Stays `:idle`.
+  defp apply_resume_policy(state, target) do
+    case state.resume_after_tap do
+      :auto ->
+        :ok = deactivate_and_repoll(state)
+        broadcast({:tag_departed, %{idx: target[:target_index], device: state.device_name}})
+        %{state | fsm: :polling, active_target: nil}
+
+      :one_shot ->
+        :ok = deactivate_only(state)
+        broadcast({:tag_departed, %{idx: target[:target_index], device: state.device_name}})
+        %{state | fsm: :idle, active_target: nil}
+
+      :manual ->
+        %{state | active_target: target}
+    end
+  end
+
+  defp broadcast_departed(%{active_target: target, device_name: name}) do
+    idx = target && target[:target_index]
+    broadcast({:tag_departed, %{idx: idx, device: name}})
   end
 
   # Send a NFC_CMD_GET_TARGET dump request for the given device. We don't wait
@@ -655,13 +735,11 @@ defmodule ExNfc.Controller do
   # NCI_POLL_ACTIVE back through IDLE → DISCOVERY, so the next tag can be
   # detected. Fire-and-forget — acks/errors land in the normal drain loop
   # and don't need to block the GenServer.
-  defp resume_polling(
-         %{sock: sock, family_id: fid, poll_protocols: protos} = _state,
-         idx
-       )
+  defp deactivate_and_repoll(%{sock: sock, family_id: fid, device_index: idx, poll_protocols: protos})
        when is_integer(idx) do
-    stop = Netlink.pack(fid, @nfc_cmd_stop_poll, Netlink.request_flags(),
-             Netlink.nla_u32(@nfc_attr_device_index, idx))
+    stop =
+      Netlink.pack(fid, @nfc_cmd_stop_poll, Netlink.request_flags(),
+        Netlink.nla_u32(@nfc_attr_device_index, idx))
 
     start_attrs =
       [
@@ -678,7 +756,21 @@ defmodule ExNfc.Controller do
     :ok
   end
 
-  defp resume_polling(_state, _idx), do: :ok
+  defp deactivate_and_repoll(_state), do: :ok
+
+  # Drop the active target without restarting polling. Lands the chip in
+  # NCI_IDLE / nfc subsystem `polling=false` — caller is expected to
+  # explicitly start_polling again later.
+  defp deactivate_only(%{sock: sock, family_id: fid, device_index: idx}) when is_integer(idx) do
+    msg =
+      Netlink.pack(fid, @nfc_cmd_stop_poll, Netlink.request_flags(),
+        Netlink.nla_u32(@nfc_attr_device_index, idx))
+
+    _ = :socket.send(sock, msg)
+    :ok
+  end
+
+  defp deactivate_only(_state), do: :ok
 
   defp parse_target(parsed) do
     nfcid1 = Netlink.find_attr(parsed, @nfc_attr_target_nfcid1)

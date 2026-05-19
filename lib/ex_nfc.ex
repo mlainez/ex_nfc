@@ -11,27 +11,61 @@ defmodule ExNfc do
   `st21nfca`, etc.) that surfaces an `nfcN` device under
   `/sys/class/nfc/`.
 
+  ## Events
+
+  Subscribers receive `{ExNfc, kind, payload}` tuples:
+
+    * `{ExNfc, :tag_arrived, %{uid_hex: "…", protocol: :iso14443_a, …}}` —
+      a tag has been activated by the chip.
+    * `{ExNfc, :tag_departed, %{idx: target_index, device: "nfc0"}}` —
+      the active tag has been deactivated (auto-resume in `:auto` mode,
+      explicit `deactivate/0` in `:manual` mode, or the tag left the
+      field).
+    * `{ExNfc, :device_added | :device_removed, %{index: i}}` — an
+      `nfcN` controller appeared / disappeared.
+
   ## Quick start
 
       iex> ExNfc.subscribe()
       :ok
       # tap a tag on the antenna...
       flush()
-      # {ExNfc, :tag_found, %{
-      #   uid_hex: "0432af1a2b5c80",
+      # {ExNfc, :tag_arrived, %{
+      #   uid_hex: "04528922F82A80",
       #   protocol: :iso14443_a,
-      #   nfcid1: <<0x04, 0x32, 0xAF, ...>>,
+      #   nfcid1: <<0x04, 0x52, 0x89, ...>>,
+      #   target_index: 1,
       #   ...
       # }}
+      # {ExNfc, :tag_departed, %{idx: 1, device: "nfc0"}}
 
   By default the supervisor brings the first discovered NFC controller
-  up at boot and starts polling for every tag type the kernel
-  advertises (Jewel / Mifare / Felica / ISO 14443-A/B / ISO 15693). Set
+  up at boot and starts polling for every tag type the chip advertises
+  (Jewel / MIFARE / Felica / ISO 14443-A/B / ISO 15693). Disable the
+  logger sink via `config :ex_nfc, log_events: false`, or change
+  controller behaviour with:
 
-      config :ex_nfc, controller: [autostart: false]
+      config :ex_nfc, controller: [
+        autostart: false,
+        resume_after_tap: :manual
+      ]
 
-  to manage the lifecycle manually with `start_polling/0` and
-  `stop_polling/0`.
+  ### Resume-after-tap policies
+
+  After a tag is activated the chip is in `NCI_POLL_ACTIVE` and stops
+  discovering. The controller's `resume_after_tap` option decides what
+  happens next:
+
+    * `:auto` (default) — drop the tag immediately and restart polling.
+      Each tap yields a `:tag_arrived` followed by `:tag_departed`.
+    * `:manual` — keep the chip in tag-active state until the caller
+      calls `ExNfc.deactivate/0`. Useful when you want to do data
+      exchange (read NDEF, etc.) before letting the next tag in.
+    * `:one_shot` — drop the tag but do not restart polling. Stays
+      idle until `ExNfc.start_polling/0` is called.
+
+  Inspect the current state with `ExNfc.state/0` (`:idle | :polling |
+  :tag_active`).
   """
 
   @doc """
@@ -69,6 +103,19 @@ defmodule ExNfc do
   @doc "Stop polling on the bound device."
   @spec stop_polling() :: :ok | {:error, term()}
   defdelegate stop_polling(), to: ExNfc.Controller
+
+  @doc """
+  Deactivate the currently active tag and resume polling.
+
+  Use this when `resume_after_tap: :manual` is set, after you've finished
+  doing whatever you wanted with the tag.
+  """
+  @spec deactivate() :: :ok | {:error, term()}
+  defdelegate deactivate(), to: ExNfc.Controller
+
+  @doc "Current controller state: `:idle | :polling | :tag_active`."
+  @spec state() :: :idle | :polling | :tag_active
+  defdelegate state(), to: ExNfc.Controller
 
   @doc "Bring the bound device down (turn the radio off)."
   @spec dev_down() :: :ok | {:error, term()}
