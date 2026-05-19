@@ -609,8 +609,16 @@ defmodule ExNfc.Controller do
       # details (UID, SENS_RES, etc.) are fetched via a separate
       # NFC_CMD_GET_TARGET dump. Issue that dump now — responses come back
       # async on this same socket as cmd = NFC_CMD_GET_TARGET messages.
+      #
+      # Auto-activation leaves the chip in NCI_POLL_ACTIVE: no further tags
+      # are discovered until the host explicitly returns it to NCI_DISCOVERY.
+      # Pipeline STOP_POLL + START_POLL immediately after the dump request
+      # — kernel processes a single socket's messages in order, so the
+      # GET_TARGET responses complete before STOP_POLL clears state.
       @nfc_event_targets_found ->
-        request_targets(state, u32(parsed, @nfc_attr_device_index))
+        idx = u32(parsed, @nfc_attr_device_index)
+        request_targets(state, idx)
+        resume_polling(state, idx)
 
       @nfc_cmd_get_target ->
         target = parse_target(parsed)
@@ -642,6 +650,35 @@ defmodule ExNfc.Controller do
   end
 
   defp request_targets(_state, _idx), do: :ok
+
+  # Send NFC_CMD_STOP_POLL then NFC_CMD_START_POLL to take the chip from
+  # NCI_POLL_ACTIVE back through IDLE → DISCOVERY, so the next tag can be
+  # detected. Fire-and-forget — acks/errors land in the normal drain loop
+  # and don't need to block the GenServer.
+  defp resume_polling(
+         %{sock: sock, family_id: fid, poll_protocols: protos} = _state,
+         idx
+       )
+       when is_integer(idx) do
+    stop = Netlink.pack(fid, @nfc_cmd_stop_poll, Netlink.request_flags(),
+             Netlink.nla_u32(@nfc_attr_device_index, idx))
+
+    start_attrs =
+      [
+        Netlink.nla_u32(@nfc_attr_device_index, idx),
+        Netlink.nla_u32(@nfc_attr_im_protocols, protos),
+        Netlink.nla_u32(@nfc_attr_tm_protocols, 0)
+      ]
+      |> IO.iodata_to_binary()
+
+    start = Netlink.pack(fid, @nfc_cmd_start_poll, Netlink.request_flags(), start_attrs)
+
+    _ = :socket.send(sock, stop)
+    _ = :socket.send(sock, start)
+    :ok
+  end
+
+  defp resume_polling(_state, _idx), do: :ok
 
   defp parse_target(parsed) do
     nfcid1 = Netlink.find_attr(parsed, @nfc_attr_target_nfcid1)
