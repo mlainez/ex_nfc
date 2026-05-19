@@ -10,11 +10,13 @@ defmodule ExNfc.Application do
   @impl Application
   def start(_type, _args) do
     controller_opts = Application.get_env(:ex_nfc, :controller, [])
+    log_events? = Application.get_env(:ex_nfc, :log_events, true)
 
-    children = [
-      {Registry, keys: :duplicate, name: ExNfc.Registry},
-      {ExNfc.Controller, controller_opts}
-    ]
+    children =
+      [
+        {Registry, keys: :duplicate, name: ExNfc.Registry},
+        {ExNfc.Controller, controller_opts}
+      ] ++ if(log_events?, do: [ExNfc.Logger], else: [])
 
     Supervisor.start_link(children, strategy: :one_for_one, name: ExNfc.Supervisor)
   end
