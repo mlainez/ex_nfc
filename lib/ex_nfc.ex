@@ -147,4 +147,67 @@ defmodule ExNfc do
   @spec transceive(ExNfc.Connection.t(), iodata(), pos_integer()) ::
           {:ok, binary()} | {:error, term()}
   defdelegate transceive(conn, payload, timeout \\ 2_000), to: ExNfc.Connection
+
+  @doc """
+  Read all NDEF records from an activated tag.
+
+  Picks Type 2 (NTAG/Ultralight, page-based) or Type 4 (ISO-DEP,
+  file-based) based on the target's protocol. Pass `tag_type:` in
+  `opts` to override.
+
+  Requires `resume_after_tap: :manual` in config — see `ExNfc.Connection`.
+  Connects + reads + closes in one call.
+  """
+  @spec read_ndef(map() | keyword(), keyword()) ::
+          {:ok, [ExNfc.NDEF.Record.t()]} | {:error, term()}
+  def read_ndef(target, opts \\ []) do
+    with {:ok, conn} <- connect(target) do
+      result = do_read_ndef(conn, target, opts)
+      ExNfc.Connection.close(conn)
+      result
+    end
+  end
+
+  @doc """
+  Write NDEF records to an activated tag. See `read_ndef/2` for tag-type
+  dispatch and lifecycle notes.
+  """
+  @spec write_ndef(map() | keyword(), [ExNfc.NDEF.Record.t()], keyword()) ::
+          :ok | {:error, term()}
+  def write_ndef(target, records, opts \\ []) do
+    with {:ok, conn} <- connect(target) do
+      result = do_write_ndef(conn, target, records, opts)
+      ExNfc.Connection.close(conn)
+      result
+    end
+  end
+
+  defp do_read_ndef(conn, target, opts) do
+    case tag_type(target, opts) do
+      :type2 -> ExNfc.NDEF.Type2.read(conn)
+      :type4 -> ExNfc.NDEF.Type4.read(conn)
+      other -> {:error, {:unsupported_tag_type, other}}
+    end
+  end
+
+  defp do_write_ndef(conn, target, records, opts) do
+    case tag_type(target, opts) do
+      :type2 -> ExNfc.NDEF.Type2.write(conn, records)
+      :type4 -> ExNfc.NDEF.Type4.write(conn, records)
+      other -> {:error, {:unsupported_tag_type, other}}
+    end
+  end
+
+  defp tag_type(target, opts) do
+    case Keyword.get(opts, :tag_type, :auto) do
+      :auto -> auto_tag_type(target)
+      other -> other
+    end
+  end
+
+  defp auto_tag_type(%{protocol: :iso14443_a}), do: :type4
+  defp auto_tag_type(%{protocol: :iso14443}), do: :type4
+  defp auto_tag_type(%{protocol: :iso14443_b}), do: :type4
+  defp auto_tag_type(%{protocol: :mifare}), do: :type2
+  defp auto_tag_type(%{protocol: p}), do: p
 end
