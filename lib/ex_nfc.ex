@@ -120,4 +120,31 @@ defmodule ExNfc do
   @doc "Bring the bound device down (turn the radio off)."
   @spec dev_down() :: :ok | {:error, term()}
   defdelegate dev_down(), to: ExNfc.Controller
+
+  @doc """
+  Open a raw `AF_NFC` connection to an activated tag for data exchange.
+
+  Set `resume_after_tap: :manual` in config so the chip stays in
+  `:tag_active` long enough to talk to the tag. See `ExNfc.Connection`
+  for the full API.
+
+      receive do
+        {ExNfc, :tag_arrived, target} ->
+          {:ok, conn} = ExNfc.connect(target)
+          {:ok, response} = ExNfc.transceive(conn, apdu)
+          ExNfc.Connection.close(conn)
+          ExNfc.deactivate()
+      end
+  """
+  @spec connect(map() | keyword()) :: {:ok, ExNfc.Connection.t()} | {:error, term()}
+  defdelegate connect(target_or_opts), to: ExNfc.Connection, as: :open
+
+  @doc """
+  Send a frame to the connected tag and wait for the response.
+
+  See `ExNfc.Connection.transceive/3`.
+  """
+  @spec transceive(ExNfc.Connection.t(), iodata(), pos_integer()) ::
+          {:ok, binary()} | {:error, term()}
+  defdelegate transceive(conn, payload, timeout \\ 2_000), to: ExNfc.Connection
 end
