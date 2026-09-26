@@ -15,10 +15,14 @@ defmodule ExNfc.NDEF.Type2 do
 
   Pages 0–3 carry the tag serial / lock bits / Capability Container,
   pages 4+ carry user data as a TLV stream: `03 LEN <NDEF bytes> FE`.
+  The connection must use protocol `:mifare` (what the kernel reports
+  for Type 2 tags).
 
   This module wraps that in `read/1` and `write/2`, taking an open
   `ExNfc.Connection` and a list of `ExNfc.NDEF.Record`s.
   """
+
+  import Bitwise
 
   alias ExNfc.Connection
   alias ExNfc.NDEF
@@ -51,86 +55,114 @@ defmodule ExNfc.NDEF.Type2 do
   @doc """
   Write a list of NDEF records to the connected Type 2 tag.
 
-  Reads the CC first to bound the write to the tag's data size, then
-  writes 4 bytes at a time. Pages are sent strictly in order; a single
-  failed write returns `{:error, {page, reason}}` without retrying.
+  Reads the CC first to check the tag is NDEF-formatted, writable and
+  large enough, then writes the NDEF TLV 4 bytes (one page) at a time
+  starting at page 4. The first page is written with a zero TLV length
+  and rewritten with the real length last, so an interrupted write
+  leaves an empty NDEF message rather than a truncated one. A failed
+  write returns `{:error, {:write_failed, page, reason}}` without
+  retrying.
   """
   @spec write(Connection.t(), [NDEF.Record.t()]) :: :ok | {:error, term()}
   def write(%Connection{} = conn, records) when is_list(records) do
-    ndef = NDEF.encode(records)
-    tlv = wrap_tlv(ndef)
+    tlv = records |> NDEF.encode() |> wrap_tlv()
 
     with {:ok, cc_block} <- read_pages(conn, @cc_page),
          {:ok, capacity} <- parse_cc(cc_block),
+         :ok <- check_writable(cc_block),
          :ok <- check_capacity(byte_size(tlv), capacity) do
-      write_pages(conn, @data_start_page, pad_to_pages(tlv))
+      <<first::binary-size(4), rest::binary>> = pad_to_pages(tlv)
+
+      with :ok <- write_pages(conn, @data_start_page, [zero_length(first)]),
+           :ok <- write_pages(conn, @data_start_page + 1, chunk_pages(rest)) do
+        write_pages(conn, @data_start_page, [first])
+      end
     end
   end
 
   # ---- READ helpers ------------------------------------------------------
 
+  # READ returns 16 bytes (4 pages); anything else is a NAK (a 4-bit
+  # code delivered as one byte) or a transport problem.
   defp read_pages(%Connection{} = conn, page) when page in 0..255 do
     case Connection.transceive(conn, <<@read_cmd, page::8>>) do
       {:ok, <<bytes::binary-size(16)>>} -> {:ok, bytes}
-      {:ok, short} when byte_size(short) > 0 -> {:ok, short}
-      {:ok, <<>>} -> {:error, :read_returned_empty}
-      {:error, _} = err -> err
+      {:ok, other} -> {:error, {:read_failed, page, other}}
+      {:error, reason} -> {:error, {:read_failed, page, reason}}
     end
   end
 
-  defp parse_cc(<<@ndef_magic, _version::8, size_div_8::8, _rw::8, _rest::binary>>) do
+  @doc false
+  # Capability Container (page 3): magic 0xE1, version, data area size / 8,
+  # access byte. Returns the data area size in bytes.
+  @spec parse_cc(binary()) :: {:ok, non_neg_integer()} | {:error, :not_ndef_formatted}
+  def parse_cc(<<@ndef_magic, _version::8, size_div_8::8, _access::8, _rest::binary>>) do
     {:ok, size_div_8 * 8}
   end
 
-  defp parse_cc(_), do: {:error, :not_ndef_formatted}
+  def parse_cc(_), do: {:error, :not_ndef_formatted}
+
+  # Write access nibble (low 4 bits of CC byte 3): 0x0 = writable.
+  defp check_writable(<<_::binary-size(3), access::8, _::binary>>) do
+    case access &&& 0x0F do
+      0 -> :ok
+      _ -> {:error, :read_only}
+    end
+  end
 
   defp read_user_area(conn, byte_count) do
     pages_needed = div(byte_count + 3, 4)
     last_page = @data_start_page + pages_needed - 1
-    do_read_loop(conn, @data_start_page, last_page, <<>>)
+    do_read_loop(conn, @data_start_page, last_page, [])
   end
 
-  defp do_read_loop(_conn, page, last, acc) when page > last, do: {:ok, acc}
+  defp do_read_loop(_conn, page, last, acc) when page > last,
+    do: {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary()}
 
   defp do_read_loop(conn, page, last, acc) do
     case read_pages(conn, page) do
-      {:ok, bytes} -> do_read_loop(conn, page + 4, last, acc <> bytes)
+      {:ok, bytes} -> do_read_loop(conn, page + 4, last, [bytes | acc])
       err -> err
     end
   end
 
-  # NDEF TLV stream: walk until we hit `03 LL …`. Skip any `00`
-  # padding TLVs and stop on `FE` terminator.
-  defp extract_ndef_tlv(<<>>), do: {:error, :no_ndef_tlv}
-  defp extract_ndef_tlv(<<0x00, rest::binary>>), do: extract_ndef_tlv(rest)
-  defp extract_ndef_tlv(<<0xFE, _::binary>>), do: {:error, :no_ndef_tlv}
+  @doc false
+  # Walk the TLV stream in the data area until the NDEF Message TLV
+  # (0x03). NULL TLVs (0x00) are skipped, other TLVs (lock / memory
+  # control, proprietary) are skipped using their length, and the
+  # terminator (0xFE) ends the search.
+  @spec extract_ndef_tlv(binary()) :: {:ok, binary()} | {:error, term()}
+  def extract_ndef_tlv(<<>>), do: {:error, :no_ndef_tlv}
+  def extract_ndef_tlv(<<0x00, rest::binary>>), do: extract_ndef_tlv(rest)
+  def extract_ndef_tlv(<<0xFE, _::binary>>), do: {:error, :no_ndef_tlv}
 
-  defp extract_ndef_tlv(<<0x03, 0xFF, len::big-16, payload::binary-size(len), _rest::binary>>) do
-    {:ok, payload}
+  def extract_ndef_tlv(<<tag, rest::binary>>) do
+    with {:ok, len, rest} <- tlv_length(rest),
+         <<value::binary-size(^len), rest::binary>> <- rest do
+      if tag == 0x03, do: {:ok, value}, else: extract_ndef_tlv(rest)
+    else
+      _ -> {:error, :malformed_tlv}
+    end
   end
 
-  defp extract_ndef_tlv(<<0x03, len::8, payload::binary-size(len), _rest::binary>>) do
-    {:ok, payload}
-  end
-
-  # Lock-control / memory-control TLVs: tag=0x01/0x02, 1-byte length,
-  # value — skip them and continue.
-  defp extract_ndef_tlv(<<t, len::8, _val::binary-size(len), rest::binary>>) when t in [0x01, 0x02] do
-    extract_ndef_tlv(rest)
-  end
-
-  defp extract_ndef_tlv(_), do: {:error, :malformed_tlv}
+  defp tlv_length(<<0xFF, len::big-16, rest::binary>>), do: {:ok, len, rest}
+  defp tlv_length(<<len::8, rest::binary>>) when len != 0xFF, do: {:ok, len, rest}
+  defp tlv_length(_), do: :error
 
   # ---- WRITE helpers -----------------------------------------------------
 
-  defp wrap_tlv(ndef) do
-    len = byte_size(ndef)
-
-    cond do
-      len < 0xFF -> <<0x03, len::8>> <> ndef <> <<0xFE>>
-      true -> <<0x03, 0xFF, len::big-16>> <> ndef <> <<0xFE>>
-    end
+  @doc false
+  # NDEF Message TLV + Terminator TLV. Lengths up to 254 use one byte,
+  # longer ones the 3-byte `FF hi lo` form.
+  @spec wrap_tlv(binary()) :: binary()
+  def wrap_tlv(ndef) when byte_size(ndef) < 0xFF do
+    <<0x03, byte_size(ndef)::8, ndef::binary, 0xFE>>
   end
+
+  def wrap_tlv(ndef), do: <<0x03, 0xFF, byte_size(ndef)::big-16, ndef::binary, 0xFE>>
+
+  defp zero_length(<<0x03, 0xFF, _len::16, _::binary>>), do: <<0x03, 0xFF, 0, 0>>
+  defp zero_length(<<0x03, _len::8, rest::binary>>), do: <<0x03, 0x00, rest::binary>>
 
   defp check_capacity(needed, cap) when needed <= cap, do: :ok
   defp check_capacity(needed, cap), do: {:error, {:tag_full, needed: needed, capacity: cap}}
@@ -142,13 +174,16 @@ defmodule ExNfc.NDEF.Type2 do
     end
   end
 
-  defp write_pages(_conn, _page, <<>>), do: :ok
+  defp chunk_pages(bin), do: for(<<page::binary-size(4) <- bin>>, do: page)
 
-  defp write_pages(conn, page, <<chunk::binary-size(4), rest::binary>>) do
-    case Connection.transceive(conn, <<@write_cmd, page::8, chunk::binary>>, 1_500) do
-      {:ok, <<ack::8>>} when ack in [0x0A, 0x00] -> write_pages(conn, page + 1, rest)
-      {:ok, other} -> {:error, {:write_nack, page: page, reply: other}}
-      {:error, reason} -> {:error, {page, reason}}
+  defp write_pages(_conn, _page, []), do: :ok
+
+  # WRITE is acknowledged with the 4-bit ACK 0xA (one byte on the wire).
+  defp write_pages(conn, page, [chunk | rest]) do
+    case Connection.transceive(conn, <<@write_cmd, page::8, chunk::binary>>) do
+      {:ok, <<0x0A>>} -> write_pages(conn, page + 1, rest)
+      {:ok, other} -> {:error, {:write_failed, page, {:nack, other}}}
+      {:error, reason} -> {:error, {:write_failed, page, reason}}
     end
   end
 end

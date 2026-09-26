@@ -31,12 +31,21 @@ defmodule ExNfc.NDEF do
   Build a full message with `encode/1`:
 
       iex> ExNfc.NDEF.encode([ExNfc.NDEF.uri("https://elixir-lang.org")])
-      <<0xD1, 0x01, 0x14, "U", 0x04, "elixir-lang.org">>
+      <<0xD1, 0x01, 0x10, "U", 0x04, "elixir-lang.org">>
 
   Parse with `decode/1`:
 
-      iex> ExNfc.NDEF.decode(<<0xD1, 0x01, 0x14, "U", 0x04, "elixir-lang.org">>)
-      {:ok, [%ExNfc.NDEF.Record{tnf: :well_known, type: "U", payload: <<0x04, "elixir-lang.org">>, id: nil}]}
+      iex> ExNfc.NDEF.decode(<<0xD1, 0x01, 0x10, "U", 0x04, "elixir-lang.org">>)
+      {:ok, [%ExNfc.NDEF.Record{tnf: :well_known, type: "U", id: nil, payload: <<0x04, "elixir-lang.org">>}]}
+
+  and read the values back:
+
+      iex> {:ok, [record]} = ExNfc.NDEF.decode(<<0xD1, 0x01, 0x10, "U", 0x04, "elixir-lang.org">>)
+      iex> ExNfc.NDEF.uri_value(record)
+      "https://elixir-lang.org"
+
+  Chunked records (`CF` flag) are not supported and decode to
+  `{:error, :chunked_record_unsupported}`.
   """
 
   import Bitwise
@@ -115,6 +124,9 @@ defmodule ExNfc.NDEF do
   Build a Well-Known URI record. The longest matching prefix from the
   NFC Forum table is encoded as a 1-byte abbreviation so the record
   is as compact as possible.
+
+      iex> ExNfc.NDEF.uri("https://www.example.com")
+      %ExNfc.NDEF.Record{tnf: :well_known, type: "U", id: nil, payload: <<0x02, "example.com">>}
   """
   @spec uri(String.t()) :: Record.t()
   def uri(url) when is_binary(url) do
@@ -123,13 +135,17 @@ defmodule ExNfc.NDEF do
   end
 
   @doc """
-  Build a Well-Known Text record. Defaults to UTF-8 + IANA language
-  tag `"en"`.
+  Build a Well-Known Text record (UTF-8). The language tag defaults to
+  `"en"`; pass `lang: "fr"` to change it.
+
+      iex> ExNfc.NDEF.text("hi", lang: "fr")
+      %ExNfc.NDEF.Record{tnf: :well_known, type: "T", id: nil, payload: <<2, "fr", "hi">>}
   """
   @spec text(String.t(), keyword()) :: Record.t()
   def text(text, opts \\ []) when is_binary(text) do
     lang = Keyword.get(opts, :lang, "en")
     status = byte_size(lang) &&& 0x3F
+
     %Record{
       tnf: :well_known,
       type: "T",
@@ -173,15 +189,19 @@ defmodule ExNfc.NDEF do
 
   defp decode_records(<<>>, acc), do: {:ok, acc}
 
+  defp decode_records(<<_mb::1, _me::1, 1::1, _::5, _::binary>>, _acc) do
+    {:error, :chunked_record_unsupported}
+  end
+
   defp decode_records(
-         <<_mb::1, _me::1, _cf::1, sr::1, il::1, tnf::3, type_len::8, rest::binary>>,
+         <<_mb::1, _me::1, 0::1, sr::1, il::1, tnf::3, type_len::8, rest::binary>>,
          acc
        ) do
     with {:ok, payload_len, rest} <- read_payload_len(sr, rest),
          {:ok, id_len, rest} <- read_id_len(il, rest),
-         <<type::binary-size(type_len), rest::binary>> <- rest,
+         <<type::binary-size(^type_len), rest::binary>> <- rest,
          {:ok, id, rest} <- read_id(id_len, rest),
-         <<payload::binary-size(payload_len), rest::binary>> <- rest do
+         <<payload::binary-size(^payload_len), rest::binary>> <- rest do
       record = %Record{tnf: Map.get(@tnf, tnf, :unknown), type: type, id: id, payload: payload}
       decode_records(rest, [record | acc])
     else
@@ -199,9 +219,10 @@ defmodule ExNfc.NDEF do
   defp read_id_len(0, rest), do: {:ok, 0, rest}
 
   defp read_id(0, rest), do: {:ok, nil, rest}
+
   defp read_id(n, bin) do
     case bin do
-      <<id::binary-size(n), rest::binary>> -> {:ok, id, rest}
+      <<id::binary-size(^n), rest::binary>> -> {:ok, id, rest}
       _ -> {:error, :short}
     end
   end
@@ -239,13 +260,17 @@ defmodule ExNfc.NDEF do
 
   @doc """
   Decode a Well-Known Text record's payload to `{lang, text}`. Returns
-  `nil` for any non-text record.
+  `nil` for any non-text record. UTF-16 text is returned undecoded.
+
+      iex> ExNfc.NDEF.text_value(ExNfc.NDEF.text("hello"))
+      {"en", "hello"}
   """
   @spec text_value(Record.t()) :: {String.t(), String.t()} | nil
   def text_value(%Record{tnf: :well_known, type: "T", payload: <<status::8, rest::binary>>}) do
     lang_len = status &&& 0x3F
+
     case rest do
-      <<lang::binary-size(lang_len), text::binary>> -> {lang, text}
+      <<lang::binary-size(^lang_len), text::binary>> -> {lang, text}
       _ -> nil
     end
   end

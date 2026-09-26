@@ -15,9 +15,13 @@ defmodule ExNfc.NDEF.Type4 do
     3. `SELECT NDEF File` (FID from CC), `READ BINARY` length + payload
     4. For writes: zero NLEN, write the payload at offset 2, write NLEN
 
-  The CC carries the per-tag max read (`MLe`) and write (`MLc`)
-  response sizes; both are respected so large payloads are split into
-  legal-size chunks.
+  The CC carries the per-tag maximum R-APDU data size (`MLe`) and
+  C-APDU data size (`MLc`); both are respected so large payloads are
+  split into legal-size chunks. Only the mapping version 2 CC layout
+  (NDEF File Control TLV `04 06 …`) is supported.
+
+  The connection must use protocol `:iso14443_a` or `:iso14443_b`
+  (ISO-DEP).
   """
 
   alias ExNfc.Connection
@@ -30,6 +34,7 @@ defmodule ExNfc.NDEF.Type4 do
 
   defmodule CC do
     @moduledoc false
+    # max_ndef_size is the NDEF file size, which includes the 2-byte NLEN.
     defstruct [:max_le, :max_lc, :ndef_fid, :max_ndef_size, :read_access, :write_access]
   end
 
@@ -40,8 +45,9 @@ defmodule ExNfc.NDEF.Type4 do
   def read(%Connection{} = conn) do
     with :ok <- select_ndef_app(conn),
          {:ok, cc} <- read_cc(conn),
+         :ok <- check_readable(cc),
          :ok <- select_file(conn, cc.ndef_fid),
-         {:ok, nlen} <- read_ndef_length(conn),
+         {:ok, nlen} <- read_ndef_length(conn, cc),
          {:ok, ndef_bytes} <- read_ndef_payload(conn, nlen, cc.max_le),
          {:ok, records} <- NDEF.decode(ndef_bytes) do
       {:ok, records}
@@ -63,7 +69,7 @@ defmodule ExNfc.NDEF.Type4 do
     with :ok <- select_ndef_app(conn),
          {:ok, cc} <- read_cc(conn),
          :ok <- check_writable(cc),
-         :ok <- check_capacity(nlen, cc.max_ndef_size),
+         :ok <- check_capacity(nlen + 2, cc.max_ndef_size),
          :ok <- select_file(conn, cc.ndef_fid),
          :ok <- update_binary(conn, 0, <<0x00, 0x00>>, cc.max_lc),
          :ok <- update_binary(conn, 2, payload, cc.max_lc),
@@ -91,11 +97,14 @@ defmodule ExNfc.NDEF.Type4 do
     end
   end
 
-  defp parse_cc(
-         <<_cclen::big-16, _ver::8, max_le::big-16, max_lc::big-16,
-           0x04, 0x06, fid_hi::8, fid_lo::8, max_ndef::big-16,
-           read_acc::8, write_acc::8, _rest::binary>>
-       ) do
+  @doc false
+  # CC file (T4T v2): CCLEN, mapping version, MLe, MLc, then the NDEF File
+  # Control TLV (T=04, L=06): file id, max NDEF file size, read / write
+  # access. The extended v3 TLV (T=06) is not supported.
+  def parse_cc(
+        <<_cclen::big-16, _ver::8, max_le::big-16, max_lc::big-16, 0x04, 0x06, fid_hi::8,
+          fid_lo::8, max_ndef::big-16, read_acc::8, write_acc::8, _rest::binary>>
+      ) do
     {:ok,
      %CC{
        max_le: max_le,
@@ -107,7 +116,10 @@ defmodule ExNfc.NDEF.Type4 do
      }}
   end
 
-  defp parse_cc(_), do: {:error, :malformed_cc}
+  def parse_cc(_), do: {:error, :malformed_cc}
+
+  defp check_readable(%CC{read_access: 0x00}), do: :ok
+  defp check_readable(%CC{read_access: code}), do: {:error, {:read_protected, code}}
 
   defp check_writable(%CC{write_access: 0x00}), do: :ok
   defp check_writable(%CC{write_access: code}), do: {:error, {:read_only, code}}
@@ -115,9 +127,10 @@ defmodule ExNfc.NDEF.Type4 do
   defp check_capacity(needed, cap) when needed <= cap, do: :ok
   defp check_capacity(needed, cap), do: {:error, {:tag_full, needed: needed, capacity: cap}}
 
-  defp read_ndef_length(conn) do
+  defp read_ndef_length(conn, %CC{max_ndef_size: max}) do
     case read_binary(conn, 0, 2) do
-      {:ok, <<nlen::big-16>>} -> {:ok, nlen}
+      {:ok, <<nlen::big-16>>} when nlen + 2 <= max -> {:ok, nlen}
+      {:ok, <<nlen::big-16>>} -> {:error, {:invalid_nlen, nlen}}
       err -> err
     end
   end
@@ -143,16 +156,13 @@ defmodule ExNfc.NDEF.Type4 do
   defp read_binary(conn, offset, len) do
     apdu = <<0x00, 0xB0, offset::big-16, len::8>>
 
-    case Connection.transceive(conn, apdu) do
-      {:ok, full} ->
-        case split_sw(full) do
-          {data, @sw_ok} when byte_size(data) == len -> {:ok, data}
-          {_, <<sw1::8, sw2::8>>} -> {:error, {:apdu_status, sw1, sw2}}
-          _ -> {:error, :short_apdu_response}
-        end
-
-      err ->
-        err
+    with {:ok, full} <- Connection.transceive(conn, apdu),
+         {:ok, data, sw} <- split_sw(full) do
+      case sw do
+        @sw_ok when byte_size(data) == len -> {:ok, data}
+        @sw_ok -> {:error, {:short_read, expected: len, got: byte_size(data)}}
+        <<sw1, sw2>> -> {:error, {:apdu_status, sw1, sw2}}
+      end
     end
   end
 
@@ -168,7 +178,7 @@ defmodule ExNfc.NDEF.Type4 do
   defp write_loop(conn, offset, payload, chunk_size) do
     {chunk, rest} =
       case payload do
-        <<c::binary-size(chunk_size), r::binary>> -> {c, r}
+        <<c::binary-size(^chunk_size), r::binary>> -> {c, r}
         _ -> {payload, <<>>}
       end
 
@@ -182,19 +192,24 @@ defmodule ExNfc.NDEF.Type4 do
 
   # ---- Generic helpers ---------------------------------------------------
 
-  defp expect_ok({:ok, bin}) when byte_size(bin) >= 2 do
+  defp expect_ok({:ok, bin}) do
     case split_sw(bin) do
-      {_, @sw_ok} -> :ok
-      {_, <<sw1::8, sw2::8>>} -> {:error, {:apdu_status, sw1, sw2}}
+      {:ok, _data, @sw_ok} -> :ok
+      {:ok, _data, <<sw1, sw2>>} -> {:error, {:apdu_status, sw1, sw2}}
+      err -> err
     end
   end
 
   defp expect_ok({:error, _} = err), do: err
-  defp expect_ok({:ok, _}), do: {:error, :short_apdu_response}
 
-  defp split_sw(bin) do
-    sz = byte_size(bin)
-    <<data::binary-size(sz - 2), sw::binary-size(2)>> = bin
-    {data, sw}
+  @doc false
+  # Split an R-APDU into data and the trailing SW1 SW2.
+  @spec split_sw(binary()) :: {:ok, binary(), <<_::16>>} | {:error, :short_apdu_response}
+  def split_sw(bin) when byte_size(bin) >= 2 do
+    data_len = byte_size(bin) - 2
+    <<data::binary-size(^data_len), sw::binary-size(2)>> = bin
+    {:ok, data, sw}
   end
+
+  def split_sw(_bin), do: {:error, :short_apdu_response}
 end
