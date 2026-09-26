@@ -34,8 +34,14 @@ defmodule ExNfc.Logger do
     {:noreply, state}
   end
 
-  def handle_info({ExNfc, :tag_departed, %{idx: idx}}, state) do
-    Logger.info("[ExNfc] tag departed idx=#{inspect(idx)}")
+  def handle_info({ExNfc, :tag_departed, %{target_index: idx}}, state) do
+    Logger.info("[ExNfc] tag departed target_index=#{inspect(idx)}")
+    {:noreply, state}
+  end
+
+  def handle_info({ExNfc, kind, %{index: idx} = dev}, state)
+      when kind in [:device_added, :device_removed] do
+    Logger.info("[ExNfc] #{kind} index=#{idx} #{dev[:name]}")
     {:noreply, state}
   end
 
@@ -45,6 +51,7 @@ defmodule ExNfc.Logger do
   defp format_tag(target) do
     [
       "uid=#{target[:uid_hex] || "?"}",
+      "target_index=#{inspect(target[:target_index])}",
       "protocol=#{inspect(target[:protocol])}",
       target[:sens_res] && "sens_res=0x#{Integer.to_string(target.sens_res, 16)}",
       target[:sel_res] && "sel_res=0x#{Integer.to_string(target.sel_res, 16)}"

@@ -19,11 +19,11 @@ defmodule ExNfc.Netlink do
 
   This module exposes:
 
-    * `pack/4` — assemble a complete netlink message.
+    * `pack/5` — assemble a complete netlink message.
     * `parse_nlmsgs/1` — split a recv buffer into individual messages.
     * `parse_attrs/1` — decode the NLA TLVs in a message body.
 
-  Constants for the NFC family itself live in `ExNfc.Controller`; this
+  Constants for the NFC family itself live in `ExNfc.NfcGenl`; this
   module is intentionally protocol-agnostic so it can be reused for any
   generic-netlink family.
   """
@@ -36,6 +36,10 @@ defmodule ExNfc.Netlink do
   @nlm_f_root 0x0100
   @nlm_f_match 0x0200
   @nlm_f_dump @nlm_f_root ||| @nlm_f_match
+
+  # nlattr type flags (uapi/linux/netlink.h). The kernel may set these on
+  # the type field; they must be masked off before comparing attribute ids.
+  @nla_type_mask 0x3FFF
 
   # nlmsghdr "well-known" types
   @nlmsg_error 0x0002
@@ -102,10 +106,16 @@ defmodule ExNfc.Netlink do
   `cmd` is the family-specific command id.
   `flags` should usually be `request_flags/0` or `dump_flags/0`.
   `attrs` is an iolist of already-packed NLAs (see `nla/2`).
+  `seq` is the `nlmsg_seq` value; the kernel echoes it in every reply
+  (acks, errors, dump parts), so use it to match replies to requests.
+  When omitted a unique sequence number is generated.
+
+      iex> ExNfc.Netlink.pack(0x10, 3, ExNfc.Netlink.request_flags(), [], 7)
+      <<20::little-32, 0x10::little-16, 5::little-16, 7::little-32, 0::32, 3, 1, 0, 0>>
   """
-  @spec pack(non_neg_integer(), non_neg_integer(), non_neg_integer(), iodata()) :: binary()
-  def pack(family_id, cmd, flags, attrs) do
-    seq = unique_seq()
+  @spec pack(non_neg_integer(), non_neg_integer(), non_neg_integer(), iodata(), non_neg_integer()) ::
+          binary()
+  def pack(family_id, cmd, flags, attrs, seq \\ next_seq()) do
     body = IO.iodata_to_binary([<<cmd::8, 1::8, 0::16>>, attrs])
     total = 16 + byte_size(body)
 
@@ -113,7 +123,12 @@ defmodule ExNfc.Netlink do
       body
   end
 
-  @doc "Pack one Netlink attribute (TLV with 4-byte alignment padding)."
+  @doc """
+  Pack one Netlink attribute (TLV with 4-byte alignment padding).
+
+      iex> ExNfc.Netlink.nla(1, <<0xAB>>)
+      <<5, 0, 1, 0, 0xAB, 0, 0, 0>>
+  """
   @spec nla(non_neg_integer(), iodata()) :: binary()
   def nla(type, value) do
     value_bin = IO.iodata_to_binary([value])
@@ -152,7 +167,7 @@ defmodule ExNfc.Netlink do
        when len >= 16 and byte_size(full) >= len do
     payload_len = len - 16
     aligned = aligned_size(len)
-    <<body::binary-size(payload_len), tail::binary>> = rest
+    <<body::binary-size(^payload_len), tail::binary>> = rest
     tail_skip = aligned - len
     tail = drop_padding(tail, tail_skip)
     parse_nlmsgs(tail, [{type, flags, seq, pid, body} | acc])
@@ -163,7 +178,7 @@ defmodule ExNfc.Netlink do
   defp drop_padding(bin, n) when n <= 0, do: bin
 
   defp drop_padding(bin, n) when byte_size(bin) >= n do
-    <<_::binary-size(n), rest::binary>> = bin
+    <<_::binary-size(^n), rest::binary>> = bin
     rest
   end
 
@@ -175,7 +190,8 @@ defmodule ExNfc.Netlink do
   Pass the message `body` *minus* the 4-byte `genlmsghdr`. Returns a
   list of `{type, value}` pairs in the order they appear. Values are
   raw binaries; nested NLAs can be re-parsed by passing them back
-  through `parse_attrs/1`.
+  through `parse_attrs/1`. The `NLA_F_NESTED` / `NLA_F_NET_BYTEORDER`
+  flag bits are masked off the returned type.
   """
   @spec parse_attrs(binary()) :: [{non_neg_integer(), binary()}]
   def parse_attrs(body), do: parse_attrs(body, [])
@@ -191,9 +207,9 @@ defmodule ExNfc.Netlink do
     aligned = aligned_size(len)
 
     case rest do
-      <<value::binary-size(val_len), tail::binary>> ->
+      <<value::binary-size(^val_len), tail::binary>> ->
         tail = drop_padding(tail, aligned - len)
-        parse_attrs(tail, [{type, value} | acc])
+        parse_attrs(tail, [{type &&& @nla_type_mask, value} | acc])
 
       _ ->
         Enum.reverse(acc)
@@ -214,10 +230,27 @@ defmodule ExNfc.Netlink do
     end
   end
 
+  @doc """
+  Decode the errno carried by an `NLMSG_ERROR` or `NLMSG_DONE` body.
+
+  Returns `0` for an ack / successful dump end, or the positive errno
+  value the kernel reported.
+
+      iex> ExNfc.Netlink.error_code(<<0::little-signed-32>>)
+      0
+      iex> ExNfc.Netlink.error_code(<<-19::little-signed-32, 0::128>>)
+      19
+  """
+  @spec error_code(binary()) :: non_neg_integer()
+  def error_code(<<errno::little-signed-32, _::binary>>), do: abs(errno)
+  def error_code(_), do: 0
+
+  @doc "Generate a fresh non-zero 32-bit sequence number."
+  @spec next_seq() :: pos_integer()
+  def next_seq do
+    rem(:erlang.unique_integer([:positive, :monotonic]), 0xFFFFFFFE) + 1
+  end
+
   defp padding(len), do: rem(4 - rem(len, 4), 4)
   defp aligned_size(len), do: len + padding(len)
-
-  defp unique_seq do
-    :erlang.unique_integer([:positive]) |> rem(0xFFFFFFFF)
-  end
 end
