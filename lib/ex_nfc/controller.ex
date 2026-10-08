@@ -7,22 +7,16 @@ defmodule ExNfc.Controller do
   GenServer that talks to the kernel NFC subsystem over `NETLINK_GENERIC`
   and drives one NFC controller.
 
-  It uses two netlink sockets:
-
-    * a **request** socket for commands (`DEV_UP`, `START_POLL`, dumps, …).
-      Every request carries a unique `nlmsg_seq` and only replies with that
-      sequence number are accepted, so late acks from a timed-out request
-      can never answer the next one. This socket never joins a multicast
-      group, so no event can be mistaken for a reply.
-    * an **event** socket joined to the `nfc` family's `events` multicast
-      group and read asynchronously (`:socket` select), so events keep
-      flowing independently of requests.
+  The netlink side is `ExNfc.Native`, a Rust NIF over `neli`: commands
+  (`DEV_UP`, `START_POLL`, dumps, …) return the kernel's answer, and the
+  `nfc` family's `events` multicast group is read on a thread of its own
+  that sends each event to this process.
 
   Lifecycle:
 
-    1. Resolve the `"nfc"` family id and its `"events"` multicast group
-       via `CTRL_CMD_GETFAMILY` (this also makes the kernel auto-load the
-       `nfc` module). If that fails — e.g. a host without NFC support —
+    1. Resolve the `"nfc"` family and join its `"events"` multicast group
+       (resolving the family also makes the kernel auto-load the `nfc`
+       module). If that fails — e.g. a host without NFC support —
        the controller stays in the `:unavailable` state, answers calls
        with `{:error, :nfc_unavailable}` and retries with exponential
        backoff (1 s up to 30 s). It never crashes the application.
@@ -50,15 +44,8 @@ defmodule ExNfc.Controller do
   require Logger
   import Bitwise
 
-  alias ExNfc.{Netlink, NfcGenl}
+  alias ExNfc.{Native, Protocol}
 
-  @af_netlink 16
-  @netlink_generic 16
-  # SOL_NETLINK / NETLINK_ADD_MEMBERSHIP (uapi/linux/netlink.h)
-  @sol_netlink 270
-  @netlink_add_membership 1
-
-  @request_timeout 10_000
   @call_timeout 30_000
   @retry_initial_ms 1_000
   @retry_max_ms 30_000
@@ -128,13 +115,12 @@ defmodule ExNfc.Controller do
   def init(opts) do
     state = %{
       family: Keyword.get(opts, :family, "nfc"),
-      req_sock: nil,
-      ev_sock: nil,
-      family_id: nil,
+      nfc: nil,
+      nfc_id: nil,
       wanted_index: Keyword.get(opts, :device_index),
       device_index: nil,
       device_name: nil,
-      requested_protocols: Keyword.get(opts, :poll_protocols) || NfcGenl.tag_protocols_mask(),
+      requested_protocols: Keyword.get(opts, :poll_protocols) || Protocol.tag_mask(),
       poll_protocols: 0,
       autostart: Keyword.get(opts, :autostart, true),
       resume_after_tap: resume_policy(Keyword.get(opts, :resume_after_tap, :auto)),
@@ -160,13 +146,13 @@ defmodule ExNfc.Controller do
   @impl GenServer
   def handle_info(:setup, state), do: {:noreply, setup(state)}
 
-  def handle_info({:"$socket", sock, :select, _}, %{ev_sock: sock} = state) do
-    {:noreply, drain_events(state)}
+  def handle_info({:ex_nfc_event, id, :closed}, %{nfc_id: id} = state) do
+    Logger.error("[ExNfc] netlink connection closed")
+    {:noreply, reset(state)}
   end
 
-  def handle_info({:"$socket", sock, :abort, info}, %{ev_sock: sock} = state) do
-    Logger.error("[ExNfc] event socket aborted: #{inspect(info)}")
-    {:noreply, reset(state)}
+  def handle_info({:ex_nfc_event, id, event}, %{nfc_id: id} = state) do
+    {:noreply, handle_event(event, state)}
   end
 
   def handle_info(_other, state), do: {:noreply, state}
@@ -201,7 +187,7 @@ defmodule ExNfc.Controller do
   end
 
   def handle_call(:stop_polling, _from, %{fsm: :polling} = state) do
-    case request(state, NfcGenl.cmd_stop_poll(), NfcGenl.device_attrs(state.device_index)) do
+    case Native.stop_poll(state.nfc, state.device_index) do
       :ok -> {:reply, :ok, %{state | fsm: :idle}}
       err -> {:reply, err, state}
     end
@@ -232,14 +218,14 @@ defmodule ExNfc.Controller do
     idx = state.device_index
 
     case state.fsm do
-      :polling -> _ = request(state, NfcGenl.cmd_stop_poll(), NfcGenl.device_attrs(idx))
+      :polling -> _ = Native.stop_poll(state.nfc, idx)
       :tag_active -> deactivate_targets(state)
       _ -> :ok
     end
 
     state = drop_targets(state)
 
-    case request(state, NfcGenl.cmd_dev_down(), NfcGenl.device_attrs(idx)) do
+    case Native.dev_down(state.nfc, idx) do
       ok when ok in [:ok, {:error, :ealready}] ->
         {:reply, :ok, %{state | fsm: :down}}
 
@@ -251,16 +237,14 @@ defmodule ExNfc.Controller do
   # ---- Setup / teardown --------------------------------------------------
 
   defp setup(state) do
-    case open_and_resolve(state) do
-      {:ok, state} ->
+    case open_nfc(state.family) do
+      {:ok, nfc, id} ->
         if state.failures > 0, do: Logger.info("[ExNfc] kernel NFC subsystem now available")
 
-        %{state | fsm: :no_device, retry_ms: @retry_initial_ms, failures: 0}
-        |> drain_events()
+        %{state | nfc: nfc, nfc_id: id, fsm: :no_device, retry_ms: @retry_initial_ms, failures: 0}
         |> discover()
 
-      {:error, reason, state} ->
-        state = close_sockets(state)
+      {:error, reason} ->
 
         if state.failures == 0 do
           Logger.warning(
@@ -282,26 +266,15 @@ defmodule ExNfc.Controller do
     end
   end
 
-  # Each step stores what it opened in `state` before the next one runs,
-  # so the caller can close everything on failure.
-  defp open_and_resolve(state) do
-    with {:req, {:ok, req_sock}} <- {:req, open_netlink()},
-         state = %{state | req_sock: req_sock},
-         {:fam, {:ok, fam}, _} <- {:fam, resolve_family(state), state},
-         {:grp, grp, _} when is_integer(grp) <- {:grp, fam.events_group, state},
-         {:ev, {:ok, ev_sock}, _} <- {:ev, open_netlink(), state},
-         state = %{state | ev_sock: ev_sock, family_id: fam.family_id},
-         {:join, :ok, _} <- {:join, join_mcast(ev_sock, grp), state} do
-      {:ok, state}
-    else
-      {:req, {:error, reason}} -> {:error, reason, state}
-      {:grp, nil, state} -> {:error, :no_events_group, state}
-      {_step, {:error, reason}, state} -> {:error, reason, state}
-    end
+  defp open_nfc(family) do
+    Native.open(family, self())
+  rescue
+    ErlangError -> {:error, :nif_not_loaded}
   end
 
+  # The connection closes once nothing references it any more.
   defp reset(state) do
-    state = close_sockets(state)
+    state = %{state | nfc: nil, nfc_id: nil}
     Process.send_after(self(), :setup, state.retry_ms)
 
     %{
@@ -314,49 +287,10 @@ defmodule ExNfc.Controller do
     }
   end
 
-  defp close_sockets(state) do
-    for sock <- [state.req_sock, state.ev_sock], sock != nil, do: :socket.close(sock)
-    %{state | req_sock: nil, ev_sock: nil, family_id: nil}
-  end
-
-  defp open_netlink() do
-    # OTP `:socket` has no typed sockaddr_nl, so pass the raw bytes that
-    # follow sa_family: 2-byte pad, pid (0 = kernel assigns), groups (0).
-    with {:ok, sock} <- :socket.open(@af_netlink, :raw, @netlink_generic) do
-      with :ok <- :socket.setopt(sock, {:otp, :rcvbuf}, 65_536),
-           :ok <- :socket.bind(sock, %{family: @af_netlink, addr: <<0::16, 0::32, 0::32>>}) do
-        {:ok, sock}
-      else
-        err ->
-          :socket.close(sock)
-          err
-      end
-    end
-  end
-
-  defp join_mcast(sock, group_id) do
-    :socket.setopt_native(sock, {@sol_netlink, @netlink_add_membership}, <<group_id::native-32>>)
-  end
-
-  defp resolve_family(state) do
-    attrs = Netlink.nla_string(Netlink.ctrl_attr_family_name(), state.family)
-
-    case transact(state.req_sock, Netlink.genl_id_ctrl(), Netlink.ctrl_cmd_getfamily(), attrs,
-           dump: false
-         ) do
-      {:ok, [body | _]} -> NfcGenl.parse_family_reply(body)
-      {:ok, []} -> {:error, :no_genl_reply}
-      err -> err
-    end
-  end
-
   # ---- Device discovery --------------------------------------------------
 
   defp dump_devices(state) do
-    case transact(state.req_sock, state.family_id, NfcGenl.cmd_get_device(), [], dump: true) do
-      {:ok, bodies} -> {:ok, Enum.map(bodies, &NfcGenl.parse_device/1)}
-      err -> err
-    end
+    Native.get_devices(state.nfc)
   end
 
   defp discover(state) do
@@ -383,7 +317,7 @@ defmodule ExNfc.Controller do
   defp bind_device(state, dev) do
     # Clamp to what the controller supports: an unsupported bit makes
     # START_POLL fail. Never poll for NFC-DEP (peer-to-peer).
-    poll = state.requested_protocols &&& (dev.protocols || 0) &&& bnot(NfcGenl.nfc_dep_mask())
+    poll = state.requested_protocols &&& (dev.protocols || 0) &&& bnot(Protocol.nfc_dep_mask())
 
     state = %{
       state
@@ -422,7 +356,7 @@ defmodule ExNfc.Controller do
   end
 
   defp dev_up(state) do
-    case request(state, NfcGenl.cmd_dev_up(), NfcGenl.device_attrs(state.device_index)) do
+    case Native.dev_up(state.nfc, state.device_index) do
       {:error, :ealready} -> :ok
       other -> other
     end
@@ -431,9 +365,7 @@ defmodule ExNfc.Controller do
   defp start_poll(%{poll_protocols: 0}), do: {:error, :no_supported_protocols}
 
   defp start_poll(state) do
-    attrs = NfcGenl.start_poll_attrs(state.device_index, state.poll_protocols)
-
-    case request(state, NfcGenl.cmd_start_poll(), attrs) do
+    case poll(state) do
       # From :idle/:down, EBUSY from nfc_start_poll means already polling.
       {:error, :ebusy} -> :ok
       other -> other
@@ -453,15 +385,14 @@ defmodule ExNfc.Controller do
   # DEV_DOWN / DEV_UP cycle clears it.
   defp repoll(state) do
     deactivate_targets(state)
-    attrs = NfcGenl.start_poll_attrs(state.device_index, state.poll_protocols)
 
-    case request(state, NfcGenl.cmd_start_poll(), attrs) do
+    case poll(state) do
       {:error, :ebusy} ->
         Logger.warning("[ExNfc] controller busy after tag release, power-cycling it")
 
         with :ok <- dev_down_ok(state),
              :ok <- dev_up(state) do
-          request(state, NfcGenl.cmd_start_poll(), attrs)
+          poll(state)
         end
 
       other ->
@@ -469,8 +400,10 @@ defmodule ExNfc.Controller do
     end
   end
 
+  defp poll(state), do: Native.start_poll(state.nfc, state.device_index, state.poll_protocols, 0)
+
   defp dev_down_ok(state) do
-    case request(state, NfcGenl.cmd_dev_down(), NfcGenl.device_attrs(state.device_index)) do
+    case Native.dev_down(state.nfc, state.device_index) do
       {:error, :ealready} -> :ok
       other -> other
     end
@@ -478,9 +411,7 @@ defmodule ExNfc.Controller do
 
   defp deactivate_targets(state) do
     for %{target_index: tidx} <- state.active_targets, is_integer(tidx) do
-      attrs = NfcGenl.target_attrs(state.device_index, tidx)
-
-      case request(state, NfcGenl.cmd_deactivate_target(), attrs) do
+      case Native.deactivate_target(state.nfc, state.device_index, tidx) do
         :ok -> :ok
         {:error, :enotconn} -> :ok
         {:error, reason} -> Logger.debug("[ExNfc] deactivate target #{tidx}: #{inspect(reason)}")
@@ -510,41 +441,7 @@ defmodule ExNfc.Controller do
     %{state | active_targets: []}
   end
 
-  # ---- Event socket ------------------------------------------------------
-
-  defp drain_events(%{ev_sock: nil} = state), do: state
-
-  defp drain_events(state) do
-    case :socket.recv(state.ev_sock, 0, :nowait) do
-      {:ok, data} ->
-        state |> handle_event_data(data) |> drain_events()
-
-      {:select, {_info, data}} ->
-        handle_event_data(state, data)
-
-      {:select, _info} ->
-        state
-
-      {:error, :enobufs} ->
-        Logger.warning("[ExNfc] event socket overrun, some NFC events were lost")
-        drain_events(state)
-
-      {:error, reason} ->
-        Logger.error("[ExNfc] event socket error: #{inspect(reason)}")
-        reset(state)
-    end
-  end
-
-  defp handle_event_data(state, data) do
-    fid = state.family_id
-
-    data
-    |> Netlink.parse_nlmsgs()
-    |> Enum.reduce(state, fn
-      {^fid, _flags, _seq, _pid, body}, acc -> handle_event(NfcGenl.parse_event(body), acc)
-      _other, acc -> acc
-    end)
-  end
+  # ---- Events -------------------------------------------------------------
 
   defp handle_event({:targets_found, idx}, %{device_index: idx} = state) when idx != nil do
     case get_targets(state) do
@@ -601,14 +498,8 @@ defmodule ExNfc.Controller do
   defp handle_event(_event, state), do: state
 
   defp get_targets(state) do
-    attrs = NfcGenl.device_attrs(state.device_index)
-
-    case transact(state.req_sock, state.family_id, NfcGenl.cmd_get_target(), attrs, dump: true) do
-      {:ok, bodies} ->
-        {:ok, Enum.map(bodies, &NfcGenl.parse_target(&1, state.device_index, state.device_name))}
-
-      err ->
-        err
+    with {:ok, targets} <- Native.get_targets(state.nfc, state.device_index) do
+      {:ok, Enum.map(targets, &Protocol.target(&1, state.device_index, state.device_name))}
     end
   end
 
@@ -631,61 +522,4 @@ defmodule ExNfc.Controller do
       for {pid, _} <- subs, do: send(pid, {ExNfc, kind, payload})
     end)
   end
-
-  # ---- Request / reply ---------------------------------------------------
-
-  defp request(state, cmd, attrs) do
-    case transact(state.req_sock, state.family_id, cmd, attrs, dump: false) do
-      {:ok, _} -> :ok
-      err -> err
-    end
-  end
-
-  # Send one request on the request socket and collect every reply with
-  # the same sequence number until the final ack / NLMSG_DONE / error.
-  # Returns the reply message bodies (genl header included).
-  defp transact(sock, family_id, cmd, attrs, dump: dump?) do
-    seq = Netlink.next_seq()
-    flags = if dump?, do: Netlink.dump_flags(), else: Netlink.request_flags()
-    msg = Netlink.pack(family_id, cmd, flags, attrs, seq)
-    deadline = System.monotonic_time(:millisecond) + @request_timeout
-
-    case :socket.send(sock, msg) do
-      :ok -> collect(sock, seq, deadline, [])
-      {:error, reason} -> {:error, {:send, reason}}
-    end
-  end
-
-  defp collect(sock, seq, deadline, acc) do
-    timeout = max(deadline - System.monotonic_time(:millisecond), 0)
-
-    case :socket.recv(sock, 0, timeout) do
-      {:ok, data} ->
-        case Netlink.parse_nlmsgs(data) |> fold_replies(seq, acc) do
-          {:done, result} -> result
-          {:more, acc} -> collect(sock, seq, deadline, acc)
-        end
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  defp fold_replies([], _seq, acc), do: {:more, acc}
-
-  defp fold_replies([{type, _flags, seq, _pid, body} | rest], seq, acc) do
-    error? = type == Netlink.nlmsg_error()
-
-    if error? or type == Netlink.nlmsg_done() do
-      case Netlink.error_code(body) do
-        0 -> {:done, {:ok, Enum.reverse(acc)}}
-        errno -> {:done, {:error, NfcGenl.errno_to_atom(errno)}}
-      end
-    else
-      fold_replies(rest, seq, [body | acc])
-    end
-  end
-
-  # Stale reply to an earlier (timed-out) request: ignore it.
-  defp fold_replies([_other | rest], seq, acc), do: fold_replies(rest, seq, acc)
 end

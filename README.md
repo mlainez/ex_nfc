@@ -6,26 +6,22 @@
 
 Elixir client for the Linux kernel NFC subsystem.
 
-Speaks `NETLINK_GENERIC` directly to the kernel's `nfc` family and uses
-`AF_NFC` sockets for data exchange — pure Elixir on OTP `:socket`, no C
-shim, no vendor daemon. Works with in-kernel NCI controllers
-(`nxp-nci-i2c`, `s3fwrn5`, `st21nfca`, …) that expose an `nfcN` device
-under `/sys/class/nfc/`.
+Talks to the kernel's `nfc` generic-netlink family through a Rust NIF
+over [`neli`](https://crates.io/crates/neli), exchanges data with tags
+over `AF_NFC` sockets (OTP `:socket`), and frames NDEF records with
+[`ndef-rs`](https://crates.io/crates/ndef-rs). No vendor daemon. Works
+with in-kernel NCI controllers (`nxp-nci-i2c`, `s3fwrn5`, `st21nfca`, …)
+that expose an `nfcN` device under `/sys/class/nfc/`.
 
 ## Status
 
-* Tag detection (polling, `:tag_arrived` / `:tag_departed` events) was
-  used on the Fairphone 3 (NXP NCI controller). The controller has since
-  been reworked (separate request/event sockets, tag release via
-  `NFC_CMD_DEACTIVATE_TARGET`, graceful degradation without NFC); the
-  netlink plumbing is exercised against a real host kernel in the test
-  suite, but the new version **has not yet been re-verified on the device**.
+* Controller handling (power, polling, device listing, kernel errors)
+  runs on the Fairphone 3 and 3+ (NXP NCI controller). Tag detection
+  (`:tag_arrived` / `:tag_departed` events) was used on the Fairphone 3.
 * Raw data exchange (`ExNfc.connect/1`, `ExNfc.transceive/3`) and NDEF
-  read/write (`ExNfc.read_ndef/2`, `ExNfc.write_ndef/3`) were fixed after
-  a review against the kernel sources (`AF_NFC` socket type, `sockaddr_nfc`
-  layout, tag release) and are covered by host tests against a simulated
-  tag, but **tag read/write has not been verified on the device since
-  those fixes**.
+  read/write (`ExNfc.read_ndef/2`, `ExNfc.write_ndef/3`) are covered by
+  host tests against a simulated tag, but **tag read/write has not been
+  verified on a device**.
 
 ## Requirements
 
@@ -44,6 +40,15 @@ it keeps retrying in the background and never takes the application down.
 ## Toolchain
 
 Built and tested with Erlang/OTP 29.1.1 and Elixir 1.20.4, matching the official Nerves systems (see `.tool-versions`).
+
+The NIF is built with Rustler, so a Rust toolchain is needed. For a
+Nerves target, put the Nerves toolchain on `PATH` and point Cargo at the
+target, e.g. in the firmware's `mix.exs`:
+
+```elixir
+System.put_env("CARGO_BUILD_TARGET", "aarch64-unknown-linux-gnu")
+System.put_env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER", "aarch64-nerves-linux-gnu-gcc")
+```
 
 ## Install
 

@@ -1,0 +1,13 @@
+[package]
+name = "ex_nfc_nif"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ndef-rs = "0.2.3"
+neli = "0.7.4"
+rustler = "0.38"

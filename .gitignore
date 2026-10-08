@@ -11,3 +11,7 @@ erl_crash.dump
 # Rust artifacts
 native/*/target/
 priv/native/
+
+# Rust NIF
+/native/ex_nfc_nif/target/
+/priv/native/

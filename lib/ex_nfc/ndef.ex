@@ -4,7 +4,7 @@
 #
 defmodule ExNfc.NDEF do
   @moduledoc """
-  NFC Data Exchange Format — pure-binary parser/serializer.
+  NFC Data Exchange Format records.
 
   NDEF is a tag-agnostic record container defined by the NFC Forum.
   This module operates on the raw byte stream: parse it after reading
@@ -44,8 +44,9 @@ defmodule ExNfc.NDEF do
       iex> ExNfc.NDEF.uri_value(record)
       "https://elixir-lang.org"
 
-  Chunked records (`CF` flag) are not supported and decode to
-  `{:error, :chunked_record_unsupported}`.
+  Record framing and the URI identifier codes come from the `ndef-rs`
+  crate (through `ExNfc.Native`). Chunked records (`CF` flag) are not
+  supported and decode to `{:error, :chunked_record_unsupported}`.
   """
 
   import Bitwise
@@ -61,46 +62,6 @@ defmodule ExNfc.NDEF do
     0x06 => :unchanged
   }
   @tnf_inv Map.new(@tnf, fn {k, v} -> {v, k} end)
-
-  # NFC Forum URI prefix table (NFC Forum URI RTD 1.0, table 3).
-  @uri_prefixes %{
-    0x00 => "",
-    0x01 => "http://www.",
-    0x02 => "https://www.",
-    0x03 => "http://",
-    0x04 => "https://",
-    0x05 => "tel:",
-    0x06 => "mailto:",
-    0x07 => "ftp://anonymous:anonymous@",
-    0x08 => "ftp://ftp.",
-    0x09 => "ftps://",
-    0x0A => "sftp://",
-    0x0B => "smb://",
-    0x0C => "nfs://",
-    0x0D => "ftp://",
-    0x0E => "dav://",
-    0x0F => "news:",
-    0x10 => "telnet://",
-    0x11 => "imap:",
-    0x12 => "rtsp://",
-    0x13 => "urn:",
-    0x14 => "pop:",
-    0x15 => "sip:",
-    0x16 => "sips:",
-    0x17 => "tftp:",
-    0x18 => "btspp://",
-    0x19 => "btl2cap://",
-    0x1A => "btgoep://",
-    0x1B => "tcpobex://",
-    0x1C => "irdaobex://",
-    0x1D => "file://",
-    0x1E => "urn:epc:id:",
-    0x1F => "urn:epc:tag:",
-    0x20 => "urn:epc:pat:",
-    0x21 => "urn:epc:raw:",
-    0x22 => "urn:epc:",
-    0x23 => "urn:nfc:"
-  }
 
   defmodule Record do
     @moduledoc "A single NDEF record. See `ExNfc.NDEF`."
@@ -122,8 +83,7 @@ defmodule ExNfc.NDEF do
 
   @doc """
   Build a Well-Known URI record. The longest matching prefix from the
-  NFC Forum table is encoded as a 1-byte abbreviation so the record
-  is as compact as possible.
+  NFC Forum table is encoded as its 1-byte identifier code.
 
       iex> ExNfc.NDEF.uri("https://www.example.com")
       %ExNfc.NDEF.Record{tnf: :well_known, type: "U", id: nil, payload: <<0x02, "example.com">>}
@@ -167,82 +127,21 @@ defmodule ExNfc.NDEF do
   256` use the short-record header.
   """
   @spec encode([Record.t()]) :: binary()
-  def encode([]), do: <<>>
-
   def encode(records) when is_list(records) do
-    last = length(records) - 1
-
-    records
-    |> Enum.with_index()
-    |> Enum.map(fn {rec, i} -> encode_record(rec, mb: i == 0, me: i == last) end)
-    |> IO.iodata_to_binary()
+    raw = for r <- records, do: {Map.fetch!(@tnf_inv, r.tnf), r.type, r.id, r.payload}
+    {:ok, bin} = ExNfc.Native.ndef_encode(raw)
+    bin
   end
 
   @doc "Decode an NDEF binary into a list of records."
   @spec decode(binary()) :: {:ok, [Record.t()]} | {:error, term()}
   def decode(bin) when is_binary(bin) do
-    case decode_records(bin, []) do
-      {:ok, records} -> {:ok, Enum.reverse(records)}
-      err -> err
+    with {:ok, raw} <- ExNfc.Native.ndef_decode(bin) do
+      {:ok,
+       for {tnf, type, id, payload} <- raw do
+         %Record{tnf: Map.get(@tnf, tnf, :unknown), type: type, id: id, payload: payload}
+       end}
     end
-  end
-
-  defp decode_records(<<>>, acc), do: {:ok, acc}
-
-  defp decode_records(<<_mb::1, _me::1, 1::1, _::5, _::binary>>, _acc) do
-    {:error, :chunked_record_unsupported}
-  end
-
-  defp decode_records(
-         <<_mb::1, _me::1, 0::1, sr::1, il::1, tnf::3, type_len::8, rest::binary>>,
-         acc
-       ) do
-    with {:ok, payload_len, rest} <- read_payload_len(sr, rest),
-         {:ok, id_len, rest} <- read_id_len(il, rest),
-         <<type::binary-size(^type_len), rest::binary>> <- rest,
-         {:ok, id, rest} <- read_id(id_len, rest),
-         <<payload::binary-size(^payload_len), rest::binary>> <- rest do
-      record = %Record{tnf: Map.get(@tnf, tnf, :unknown), type: type, id: id, payload: payload}
-      decode_records(rest, [record | acc])
-    else
-      _ -> {:error, :malformed_ndef}
-    end
-  end
-
-  defp decode_records(_, _), do: {:error, :malformed_ndef}
-
-  defp read_payload_len(1, <<len::8, rest::binary>>), do: {:ok, len, rest}
-  defp read_payload_len(0, <<len::big-32, rest::binary>>), do: {:ok, len, rest}
-  defp read_payload_len(_, _), do: {:error, :short}
-
-  defp read_id_len(1, <<len::8, rest::binary>>), do: {:ok, len, rest}
-  defp read_id_len(0, rest), do: {:ok, 0, rest}
-
-  defp read_id(0, rest), do: {:ok, nil, rest}
-
-  defp read_id(n, bin) do
-    case bin do
-      <<id::binary-size(^n), rest::binary>> -> {:ok, id, rest}
-      _ -> {:error, :short}
-    end
-  end
-
-  defp encode_record(%Record{} = r, opts) do
-    mb = if Keyword.get(opts, :mb, false), do: 1, else: 0
-    me = if Keyword.get(opts, :me, false), do: 1, else: 0
-    cf = 0
-    il = if r.id && byte_size(r.id) > 0, do: 1, else: 0
-    type_len = byte_size(r.type)
-    payload_len = byte_size(r.payload)
-    sr = if payload_len < 256, do: 1, else: 0
-    tnf = Map.fetch!(@tnf_inv, r.tnf)
-
-    header = <<mb::1, me::1, cf::1, sr::1, il::1, tnf::3, type_len::8>>
-    plen = if sr == 1, do: <<payload_len::8>>, else: <<payload_len::big-32>>
-    id_len_bytes = if il == 1, do: <<byte_size(r.id)::8>>, else: <<>>
-    id_bytes = if il == 1, do: r.id, else: <<>>
-
-    [header, plen, id_len_bytes, r.type, id_bytes, r.payload]
   end
 
   # ---- URI helpers -------------------------------------------------------
@@ -253,7 +152,7 @@ defmodule ExNfc.NDEF do
   """
   @spec uri_value(Record.t()) :: String.t() | nil
   def uri_value(%Record{tnf: :well_known, type: "U", payload: <<code::8, rest::binary>>}) do
-    Map.get(@uri_prefixes, code, "") <> rest
+    Map.get(uri_prefixes(), code, "") <> rest
   end
 
   def uri_value(_), do: nil
@@ -277,15 +176,13 @@ defmodule ExNfc.NDEF do
 
   def text_value(_), do: nil
 
-  defp pick_uri_prefixes() do
-    # Longest prefix first so e.g. "https://www." wins over "https://".
-    @uri_prefixes
-    |> Enum.reject(fn {_code, p} -> p == "" end)
-    |> Enum.sort_by(fn {_code, p} -> -byte_size(p) end)
-  end
+  defp uri_prefixes, do: ExNfc.Native.uri_prefixes()
 
   defp pick_uri_prefix(url) do
-    Enum.find_value(pick_uri_prefixes(), {0x00, url}, fn {code, prefix} ->
+    uri_prefixes()
+    |> Enum.reject(fn {_code, prefix} -> prefix == "" end)
+    |> Enum.sort_by(fn {_code, prefix} -> -byte_size(prefix) end)
+    |> Enum.find_value({0x00, url}, fn {code, prefix} ->
       if String.starts_with?(url, prefix) do
         {code, binary_part(url, byte_size(prefix), byte_size(url) - byte_size(prefix))}
       end

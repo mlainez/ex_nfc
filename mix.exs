@@ -23,6 +23,6 @@ defmodule ExNfc.MixProject do
   defp elixirc_paths(_), do: ["lib"]
 
   defp deps do
-    []
+    [{:rustler, "~> 0.38.0", runtime: false}]
   end
 end

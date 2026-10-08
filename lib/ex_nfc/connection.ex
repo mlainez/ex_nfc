@@ -41,7 +41,7 @@ defmodule ExNfc.Connection do
 
   require Logger
 
-  alias ExNfc.NfcGenl
+  alias ExNfc.Protocol
 
   @af_nfc 39
   @nfc_sockproto_raw 0
@@ -165,7 +165,7 @@ defmodule ExNfc.Connection do
   end
 
   defp protocol(proto) do
-    case NfcGenl.protocol_value(proto) do
+    case Protocol.value(proto) do
       {:ok, n} -> {:ok, n}
       :error -> {:error, {:unknown_protocol, proto}}
     end
